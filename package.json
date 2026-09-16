@@ -6,9 +6,12 @@
     "dev": "next dev -p 4040",
     "build": "next build",
     "start": "next start -p 4040",
-    "lint": "next lint"
+    "lint": "next lint",
+    "db:migrate": "node --env-file=.env.local scripts/db.mjs migrate",
+    "db:setup": "node --env-file=.env.local scripts/db.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "next": "15.5.4",
     "react": "19.1.1",
     "react-dom": "19.1.1",

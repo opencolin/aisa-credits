@@ -1,74 +1,93 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { neon, type NeonQueryFunction } from "@neondatabase/serverless";
 
 import { sharedCodeFor, uniqueCodeBatch } from "./codes";
-import type { Db, EventPromo, PublicEvent, Redemption } from "./types";
-
-const DATA_DIR = path.join(process.cwd(), ".data");
-const DB_PATH = path.join(DATA_DIR, "db.json");
+import type { EventPromo, PublicEvent, Redemption, UniqueCode } from "./types";
 
 /**
- * Serialises read-modify-write cycles within this process.
+ * Postgres on Neon, provisioned through the Vercel integration (DATABASE_URL).
  *
- * Two people clicking "Claim" at the same booth at the same moment must not
- * both read the same `grantedCents` and both pass the budget check — that is
- * exactly how a capped budget gets overspent.
+ * This replaced a JSON file guarded by an in-process lock. Both halves of that stopped
+ * being true on Vercel: the filesystem is not shared or kept between function instances,
+ * and a lock inside one instance is invisible to the others. The budget rule now lives in
+ * the database — see redeem_code() in db/schema.mjs.
+ *
+ * Every exported signature is unchanged, so no page or component had to learn about this.
  */
-let queue: Promise<unknown> = Promise.resolve();
-
-function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  const run = queue.then(fn, fn);
-  queue = run.catch(() => {});
-  return run;
-}
-
-async function readDb(): Promise<Db> {
-  try {
-    return JSON.parse(await readFile(DB_PATH, "utf8")) as Db;
-  } catch {
-    const seeded = seed();
-    await writeDb(seeded);
-    return seeded;
+let client: NeonQueryFunction<false, false> | null = null;
+function db() {
+  if (!client) {
+    const url = process.env.DATABASE_URL;
+    if (!url) throw new Error("DATABASE_URL is not set — connect the Neon integration or run `vercel env pull`.");
+    client = neon(url);
   }
+  return client;
 }
 
-async function writeDb(db: Db): Promise<void> {
-  await mkdir(DATA_DIR, { recursive: true });
-  // Write-then-rename: a crash mid-write leaves the previous file intact
-  // rather than a truncated JSON blob that takes the whole app down.
-  const tmp = `${DB_PATH}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(db, null, 2), "utf8");
-  await rename(tmp, DB_PATH);
+/** The driver hands timestamps back as Date or string depending on the path; the app wants ISO. */
+const iso = (v: unknown): string => new Date(v as string).toISOString();
+const isoOrNull = (v: unknown): string | null => (v == null ? null : iso(v));
+
+type Row = Record<string, unknown>;
+
+function toEvent(r: Row): EventPromo {
+  return {
+    id: String(r.id),
+    slug: String(r.slug),
+    title: String(r.title),
+    description: String(r.description ?? ""),
+    status: r.status as EventPromo["status"],
+    codeMode: r.code_mode as EventPromo["codeMode"],
+    sharedCode: (r.shared_code as string | null) ?? null,
+    creditCents: Number(r.credit_cents),
+    budgetCapCents: Number(r.budget_cap_cents),
+    grantedCents: Number(r.granted_cents),
+    grantCount: Number(r.grant_count),
+    expiryDays: r.expiry_days == null ? null : Number(r.expiry_days),
+    createdAt: iso(r.created_at),
+    activatedAt: isoOrNull(r.activated_at),
+    endedAt: isoOrNull(r.ended_at),
+  };
 }
 
 export async function listEvents(): Promise<EventPromo[]> {
-  const db = await readDb();
-  return [...db.events].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rows = await db().query("select * from events order by created_at desc");
+  return rows.map(toEvent);
 }
 
 export async function getEventBySlug(slug: string): Promise<EventPromo | null> {
-  const db = await readDb();
-  return db.events.find((e) => e.slug === slug) ?? null;
+  const rows = await db().query("select * from events where slug = $1", [slug]);
+  return rows[0] ? toEvent(rows[0]) : null;
 }
 
 export async function getEventById(id: string): Promise<EventPromo | null> {
-  const db = await readDb();
-  return db.events.find((e) => e.id === id) ?? null;
+  const rows = await db().query("select * from events where id = $1", [id]);
+  return rows[0] ? toEvent(rows[0]) : null;
 }
 
 export async function listRedemptions(eventId: string): Promise<Redemption[]> {
-  const db = await readDb();
-  return db.redemptions
-    .filter((r) => r.eventId === eventId)
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const rows = await db().query("select * from redemptions where event_id = $1 order by created_at desc", [eventId]);
+  return rows.map((r) => ({
+    id: String(r.id),
+    eventId: String(r.event_id),
+    code: String(r.code),
+    email: String(r.email),
+    amountCents: Number(r.amount_cents),
+    createdAt: iso(r.created_at),
+    expiresAt: isoOrNull(r.expires_at),
+  }));
 }
 
-export async function listUniqueCodes(eventId: string) {
-  const db = await readDb();
-  return db.uniqueCodes.filter((c) => c.eventId === eventId);
+export async function listUniqueCodes(eventId: string): Promise<UniqueCode[]> {
+  const rows = await db().query("select * from unique_codes where event_id = $1 order by code", [eventId]);
+  return rows.map((r) => ({
+    code: String(r.code),
+    eventId: String(r.event_id),
+    redeemedAt: isoOrNull(r.redeemed_at),
+    redeemedBy: (r.redeemed_by as string | null) ?? null,
+  }));
 }
 
 export function remainingCents(event: EventPromo): number {
@@ -99,6 +118,11 @@ export function toPublicEvent(event: EventPromo): PublicEvent {
   };
 }
 
+/** Postgres error codes this file turns into sentences. */
+const UNIQUE_VIOLATION = "23505";
+const CHECK_VIOLATION = "23514";
+const pgError = (err: unknown) => err as { code?: string; constraint?: string };
+
 export type CreateEventInput = {
   title: string;
   slug: string;
@@ -111,44 +135,47 @@ export type CreateEventInput = {
 };
 
 export async function createEvent(input: CreateEventInput): Promise<EventPromo> {
-  return withLock(async () => {
-    const db = await readDb();
-    if (db.events.some((e) => e.slug === input.slug)) {
+  const sql = db();
+  const id = randomUUID();
+  const insertEvent = sql.query(
+    // Always born as a draft: a page that grants credits the moment it is created
+    // will start paying out while the copy is still being edited.
+    `insert into events (id, slug, title, description, status, code_mode, shared_code,
+       credit_cents, budget_cap_cents, expiry_days)
+     values ($1, $2, $3, $4, 'draft', $5, $6, $7, $8, $9)
+     returning *`,
+    [
+      id,
+      input.slug,
+      input.title,
+      input.description,
+      input.codeMode,
+      input.codeMode === "shared" ? sharedCodeFor(input.slug) : null,
+      input.creditCents,
+      input.budgetCapCents,
+      input.expiryDays,
+    ],
+  );
+
+  const queries = [insertEvent];
+  if (input.codeMode === "unique") {
+    const count = Math.max(1, Math.min(input.uniqueCodeCount ?? 100, 5000));
+    queries.push(
+      sql.query("insert into unique_codes (code, event_id) select unnest($1::text[]), $2", [uniqueCodeBatch(count), id]),
+    );
+  }
+
+  try {
+    // One transaction: an event never exists without the batch of codes it was created with.
+    const [rows] = await sql.transaction(queries);
+    return toEvent((rows as Row[])[0]);
+  } catch (err) {
+    const e = pgError(err);
+    if (e.code === UNIQUE_VIOLATION && e.constraint === "events_slug_key") {
       throw new Error(`An event page already uses the slug "${input.slug}".`);
     }
-
-    const event: EventPromo = {
-      id: randomUUID(),
-      slug: input.slug,
-      title: input.title,
-      description: input.description,
-      // Always born as a draft: a page that grants credits the moment it is
-      // created will start paying out while the copy is still being edited.
-      status: "draft",
-      codeMode: input.codeMode,
-      sharedCode: input.codeMode === "shared" ? sharedCodeFor(input.slug) : null,
-      creditCents: input.creditCents,
-      budgetCapCents: input.budgetCapCents,
-      grantedCents: 0,
-      grantCount: 0,
-      expiryDays: input.expiryDays,
-      createdAt: new Date().toISOString(),
-      activatedAt: null,
-      endedAt: null,
-    };
-
-    db.events.push(event);
-
-    if (input.codeMode === "unique") {
-      const count = Math.max(1, Math.min(input.uniqueCodeCount ?? 100, 5000));
-      for (const code of uniqueCodeBatch(count)) {
-        db.uniqueCodes.push({ code, eventId: event.id, redeemedAt: null, redeemedBy: null });
-      }
-    }
-
-    await writeDb(db);
-    return event;
-  });
+    throw err;
+  }
 }
 
 export type UpdateEventInput = Partial<
@@ -156,25 +183,44 @@ export type UpdateEventInput = Partial<
 >;
 
 export async function updateEvent(id: string, patch: UpdateEventInput): Promise<EventPromo> {
-  return withLock(async () => {
-    const db = await readDb();
-    const event = db.events.find((e) => e.id === id);
-    if (!event) throw new Error("Event not found.");
-
-    if (patch.budgetCapCents !== undefined && patch.budgetCapCents < event.grantedCents) {
-      throw new Error(
-        `Budget cap cannot be lower than the ${(event.grantedCents / 100).toFixed(2)} already granted.`,
-      );
+  try {
+    const rows = await db().query(
+      `update events set
+         title            = coalesce($2, title),
+         description      = coalesce($3, description),
+         credit_cents     = coalesce($4, credit_cents),
+         budget_cap_cents = coalesce($5, budget_cap_cents),
+         expiry_days      = case when $6::boolean then $7::integer else expiry_days end,
+         status           = coalesce($8, status),
+         activated_at     = case when $8::text = 'active' and activated_at is null then now() else activated_at end,
+         ended_at         = case when $8::text = 'ended' then now() else ended_at end
+       where id = $1
+       returning *`,
+      [
+        id,
+        patch.title ?? null,
+        patch.description ?? null,
+        patch.creditCents ?? null,
+        patch.budgetCapCents ?? null,
+        // expiryDays distinguishes "leave it" (undefined) from "never expires" (null).
+        patch.expiryDays !== undefined,
+        patch.expiryDays ?? null,
+        patch.status ?? null,
+      ],
+    );
+    if (!rows[0]) throw new Error("Event not found.");
+    return toEvent(rows[0]);
+  } catch (err) {
+    const e = pgError(err);
+    if (e.code === CHECK_VIOLATION && e.constraint === "granted_within_cap") {
+      // Checked by the database rather than by reading first: a grant can land between a
+      // read and this write, and the constraint is the only check that sees it.
+      const current = await getEventById(id);
+      const granted = current ? (current.grantedCents / 100).toFixed(2) : "the amount";
+      throw new Error(`Budget cap cannot be lower than the ${granted} already granted.`);
     }
-
-    Object.assign(event, patch);
-
-    if (patch.status === "active" && !event.activatedAt) event.activatedAt = new Date().toISOString();
-    if (patch.status === "ended") event.endedAt = new Date().toISOString();
-
-    await writeDb(db);
-    return event;
-  });
+    throw err;
+  }
 }
 
 export type RedeemResult =
@@ -182,195 +228,12 @@ export type RedeemResult =
   | { ok: false; reason: string };
 
 /**
- * Redeem a promo code for an account.
- *
- * Every rejection path returns the same shape so the caller never has to
- * distinguish "not found" from "already used" to render a message — and so
- * the response never leaks which codes exist.
+ * Redeem a promo code for an account — one call to redeem_code() in the database, which
+ * locks the event row for the length of the claim. Every rejection path returns the same
+ * shape, so a caller never has to tell "not found" from "already used", and the response
+ * never reveals which codes exist.
  */
 export async function redeemCode(rawCode: string, email: string): Promise<RedeemResult> {
-  return withLock(async () => {
-    const code = rawCode.trim().toUpperCase();
-    const account = email.trim().toLowerCase();
-    const db = await readDb();
-
-    const event = db.events.find(
-      (e) =>
-        (e.codeMode === "shared" && e.sharedCode === code) ||
-        (e.codeMode === "unique" && db.uniqueCodes.some((c) => c.code === code && c.eventId === e.id)),
-    );
-
-    if (!event) return { ok: false, reason: "That code isn't recognised. Check for typos and try again." };
-    if (event.status === "draft") return { ok: false, reason: "This code isn't active yet." };
-    if (event.status === "ended") return { ok: false, reason: "This offer has ended." };
-    if (remainingCents(event) < event.creditCents) {
-      return { ok: false, reason: "This offer has run out of credits." };
-    }
-
-    if (event.codeMode === "unique") {
-      const entry = db.uniqueCodes.find((c) => c.code === code && c.eventId === event.id);
-      if (!entry) return { ok: false, reason: "That code isn't recognised." };
-      if (entry.redeemedAt) return { ok: false, reason: "That code has already been used." };
-      entry.redeemedAt = new Date().toISOString();
-      entry.redeemedBy = account;
-    } else if (db.redemptions.some((r) => r.eventId === event.id && r.email === account)) {
-      // One grant per account per event, or a single shared code drains the
-      // whole cap from one laptop.
-      return { ok: false, reason: "You've already claimed credits from this event." };
-    }
-
-    const now = new Date();
-    const expiresAt = event.expiryDays
-      ? new Date(now.getTime() + event.expiryDays * 86_400_000).toISOString()
-      : null;
-
-    db.redemptions.push({
-      id: randomUUID(),
-      eventId: event.id,
-      code,
-      email: account,
-      amountCents: event.creditCents,
-      createdAt: now.toISOString(),
-      expiresAt,
-    });
-
-    event.grantedCents += event.creditCents;
-    event.grantCount += 1;
-
-    await writeDb(db);
-    return { ok: true, amountCents: event.creditCents, expiresAt, eventTitle: event.title };
-  });
-}
-
-function seed(): Db {
-  const day = 86_400_000;
-  const ago = (d: number) => new Date(Date.now() - d * day).toISOString();
-
-  const events: EventPromo[] = [
-    {
-      id: "evt_agents_sf",
-      slug: "agents-sf",
-      title: "Agents SF",
-      description:
-        "Give your agent one key and 5,000+ live APIs for the weekend. Credits land in your promo balance the moment you sign up.",
-      status: "active",
-      codeMode: "shared",
-      sharedCode: "AISA-AGENTS-SF-7K3M",
-      creditCents: 20000,
-      budgetCapCents: 2000000,
-      grantedCents: 340000,
-      grantCount: 17,
-      expiryDays: 180,
-      createdAt: ago(21),
-      activatedAt: ago(20),
-      endedAt: null,
-    },
-    {
-      id: "evt_hermes_hack",
-      slug: "hermes-hack",
-      title: "Hermes Agent Hackathon",
-      description:
-        "Build a Hermes agent that pays its own way. Every API call, skill and model runs through a single Aisa key.",
-      status: "active",
-      codeMode: "unique",
-      sharedCode: null,
-      creditCents: 25000,
-      budgetCapCents: 5000000,
-      grantedCents: 450000,
-      grantCount: 18,
-      expiryDays: 30,
-      createdAt: ago(14),
-      activatedAt: ago(13),
-      endedAt: null,
-    },
-    {
-      id: "evt_x402_devday",
-      slug: "x402-devday",
-      title: "x402 Dev Day",
-      description:
-        "Machine payments, end to end. Point your agent at Aisa and let it settle per call in USDC over x402.",
-      status: "active",
-      codeMode: "shared",
-      sharedCode: "AISA-X402-DEVDAY-QN84",
-      creditCents: 10000,
-      budgetCapCents: 1000000,
-      grantedCents: 200000,
-      grantCount: 20,
-      expiryDays: 180,
-      createdAt: ago(9),
-      activatedAt: ago(8),
-      endedAt: null,
-    },
-    {
-      id: "evt_aisa_hq",
-      slug: "aisa-hq",
-      title: "Welcome to Aisa HQ",
-      description: "You're on the guest wifi. Here's a starter balance to point an agent at while you're here.",
-      status: "active",
-      codeMode: "shared",
-      sharedCode: "AISA-AISA-HQ-3RT9",
-      creditCents: 2500,
-      budgetCapCents: 1000000,
-      grantedCents: 0,
-      grantCount: 0,
-      expiryDays: 180,
-      createdAt: ago(30),
-      activatedAt: ago(30),
-      endedAt: null,
-    },
-    {
-      id: "evt_token_factory",
-      slug: "token-factory",
-      title: "Token Factory Builders",
-      description:
-        "110+ models and 5,000+ APIs behind one key, billed per call. No per-vendor contracts to sign first.",
-      status: "active",
-      codeMode: "shared",
-      sharedCode: "AISA-TOKEN-FACTORY-M2WD",
-      creditCents: 60000,
-      budgetCapCents: 2000000,
-      grantedCents: 1980000,
-      grantCount: 33,
-      expiryDays: 180,
-      createdAt: ago(45),
-      activatedAt: ago(44),
-      endedAt: null,
-    },
-    {
-      id: "evt_kubecon_2026",
-      slug: "kubecon-2026",
-      title: "KubeCon 2026",
-      description: "",
-      status: "draft",
-      codeMode: "shared",
-      sharedCode: "AISA-KUBECON-2026-8DPX",
-      creditCents: 2500,
-      budgetCapCents: 100000,
-      grantedCents: 0,
-      grantCount: 0,
-      expiryDays: null,
-      createdAt: ago(2),
-      activatedAt: null,
-      endedAt: null,
-    },
-    {
-      id: "evt_ethdenver",
-      slug: "ethdenver-2026",
-      title: "ETHDenver 2026",
-      description: "Agentic commerce, settled onchain. One key for every resource your agent calls.",
-      status: "ended",
-      codeMode: "shared",
-      sharedCode: "AISA-ETHDENVER-2026-VK57",
-      creditCents: 15000,
-      budgetCapCents: 750000,
-      grantedCents: 750000,
-      grantCount: 50,
-      expiryDays: 90,
-      createdAt: ago(120),
-      activatedAt: ago(119),
-      endedAt: ago(60),
-    },
-  ];
-
-  return { events, uniqueCodes: [], redemptions: [] };
+  const rows = await db().query("select redeem_code($1, $2) as result", [rawCode, email]);
+  return rows[0].result as RedeemResult;
 }

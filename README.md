@@ -38,10 +38,13 @@ recommends keeping the mark and letting prose behave like a proper noun.
   than `status === "active"`: an active event whose remaining budget can't
   cover one more grant stops advertising, drops its code, and links to plain
   signup. The console flags these as *Budget exhausted*.
-- **Budget caps hold under concurrency.** Redemption is serialised, so
-  simultaneous claims at a booth can't both read the same `grantedCents` and
-  both pass the check. Verified: 10 concurrent claims against a 3-grant cap
-  yield exactly 3.
+- **Budget caps hold under concurrency.** Redemption is one call to a Postgres
+  function, `redeem_code()`, which locks the event's row for the length of the
+  claim — so simultaneous claims at a booth can't both read the same
+  `granted_cents` and both pass the check, however many Vercel instances are
+  serving them. A `granted_within_cap` constraint refuses an overspend even if
+  the application gets it wrong. Verified: 20 concurrent claims against a
+  3-grant cap yield exactly 3.
 - **One grant per account per event** for shared codes; single-use codes are
   burned on redemption.
 - **Events are born as drafts.** A page that pays out the moment it's created
@@ -60,11 +63,20 @@ slide from the back of a room doesn't become a support ticket.
 
 ## Running it
 
+Live on Vercel (project `aisa-credits`, team `dablclub`); every push to `main`
+deploys.
+
+State is Postgres on Neon, provisioned through the Vercel integration, which
+puts `DATABASE_URL` on the project. The schema, including `redeem_code()`, is
+in `db/schema.mjs`; every statement is idempotent.
+
 ```bash
 npm install
-npm run dev     # http://localhost:4040
+npx vercel link --project aisa-credits --scope dablclub
+npx vercel env pull .env.local     # DATABASE_URL — gitignored, never commit it
+npm run db:setup                   # migrate, then seed demo events into an EMPTY database
+npm run dev                        # http://localhost:4040
 ```
 
-State lives in `.data/db.json` (gitignored), seeded on first read. Swap
-`lib/store.ts` for the real billing service to productionise — the module
-boundary is the whole integration surface.
+`db:setup` seeds only when the `events` table is empty, so re-running it never
+touches real data; `npm run db:migrate` applies the schema alone.
